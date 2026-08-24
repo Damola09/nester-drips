@@ -332,14 +332,29 @@ pgx v5 handles `uuid.UUID` natively; passing `.String()` forces implicit server-
 **File:** `packages/contracts/contracts/vault/src/lib.rs`
 Returns `amount_for_shares(shares)` before management, early-withdrawal, and performance fees. Any DApp passing this directly as `min_assets_out` will hit `SlippageExceeded` on every fee-bearing withdrawal. Fix: either add `preview_withdraw_net` that applies fee estimates on-chain, or document explicitly and have the DApp subtract fees.
 
-### B-11 — `float64` precision loss in `extractEventAmount` — RESOLVED (issue #1051)
+### B-11 — `float64` precision loss in `extractEventAmount` — RESOLVED
 **File:** `apps/api/internal/stellar/indexer.go`
 
-Resolved. Amounts decode via `UseNumber()` into `decimal.Decimal`; the
-`case float64` branch is now a rejection guard rather than a conversion, and
-migration `102` widens the vault balance columns to `NUMERIC(48,8)` so i128
-stroop amounts persist exactly. Evidence: `TestIntegrationLargeAmountRoundTripsExactly`,
-`TestAmountPathHasNoFloat64`.
+Resolved in two parts, by two separate changes:
+
+**Parsing (pre-dates issue #1051).** Amounts decode via `UseNumber()` into
+`decimal.Decimal`, so they arrive as `json.Number` and never pass through
+`float64`. The `case float64` branch is a bounds check, not a pure guard: it
+*rejects* values that are non-integral or exceed 2^53 (where precision is
+already lost), and *converts* smaller values via `int64(v)`, which is exact in
+that range. This branch only sees stray `float64` inputs, since the RPC path
+yields `json.Number`.
+
+**Persistence (issue #1051).** Migration `103` widens the vault balance columns
+from `NUMERIC(20,8)` to `NUMERIC(48,8)`. This is the part that was still
+broken: the old type allowed only 12 integer digits, so a 1e18 stroop deposit
+raised `numeric field overflow` and the event was rejected outright. Parsing
+had been correct; storage was not.
+
+Evidence: `TestIntegrationLargeAmountRoundTripsExactly` (end-to-end round-trip
+through the real schema), `TestExtractEventAmount_RejectsUnsafeFloat64`, and
+`TestAmountPathHasNoFloat64` (source-level guard against reintroducing a
+`float64` conversion).
 
 Original finding:
 A `float64` case is handled for Soroban event amounts. `float64` loses precision above 2^53 — Soroban amounts come as strings and can exceed this range. Fix: treat any non-string amount type as unparseable; only accept `string`.

@@ -123,20 +123,68 @@ permutation that moves a withdrawal ahead of the deposit funding it fails the
 constraint rather than corrupting the balance. Failing loudly is correct, and
 because the poller stops on error rather than skipping, the next pass retries.
 
+## Not covered: ledger reorganisations
+
+**The replay guarantees above assume an append-only ledger history. Reorgs are
+out of scope for this harness and are not handled by `EventPoller`.**
+
+This is a real gap, stated here rather than left implicit, because a document
+titled "Replay Guarantees" that silently omits the one replay case caused by
+the *chain* rather than the *delivery* would be misleading.
+
+What exists today:
+
+- `ReorgSafeIndexer` (`reorg_indexer.go`) and migration
+  `100_reorg_safe_indexer` (`ledger_checkpoints`, plus `tx_hash` /
+  `event_index` columns on `processed_events`) implement parent-hash
+  verification and checkpoint rollback.
+- **Neither has a non-test caller.** `EventPoller` does not reference
+  `ledger_checkpoints`, `parent_hash`, or `ReorgSafeIndexer`, and routing
+  production through the poller leaves that machinery unreached.
+
+Two specific incompatibilities to resolve before the two can be joined:
+
+1. **Cursor monotonicity blocks rewind.** `advanceCursorTx` uses `GREATEST`, so
+   the cursor can only move forward. A reorg requires moving it *backwards* to
+   the fork point. Any reorg integration must either bypass `advanceCursorTx`
+   for the rollback or make the rewind explicit and auditable, rather than
+   quietly dropping the monotonicity that protects the forward path.
+2. **`revertToCheckpoint` does not rewind the cursor at all.** It deletes
+   `processed_events` and `ledger_checkpoints` rows above the fork point, but
+   leaves `event_indexer.last_ledger` untouched. On its own that would delete
+   the dedup records while the cursor still points past them, so the reverted
+   events would never be re-fetched — the rollback would drop events rather
+   than replay them.
+
+Until that integration lands, the indexer is correct on an append-only history
+and undefined under a reorg. Soroban/Stellar finality makes deep reorgs rare,
+which is presumably why this has not bitten yet, but "rare" is not "handled".
+Tracking this as follow-up work is deliberate: it is outside issue #1051's
+acceptance criteria, and folding an unreviewed reorg path into this change
+would weaken rather than strengthen the guarantees proven here.
+
 ## Integer precision
 
 Soroban amounts are `i128` stroops and routinely exceed `float64`'s exact
 integer limit of 2^53 (~9.007e15). A 1e18 stroop deposit is an ordinary vault
 deposit.
 
-- Amounts are decoded with `json.Decoder.UseNumber()`, so they arrive as
-  `json.Number` and are parsed into `decimal.Decimal` — never through
-  `float64`.
-- The `case float64` branch in `extractEventAmount` is a **rejection guard**,
-  not a conversion: a `float64` outside the exactly-representable integer range
-  has already lost precision before the indexer saw it, so it is rejected
-  instead of written.
-- Migration `102` widens `vaults.total_deposited`, `current_balance`,
+Two distinct things have to hold — the amount must *parse* exactly, and it must
+*persist* exactly. Parsing was already correct before this work; persistence
+was not.
+
+- **Parsing (pre-existing).** Amounts are decoded with
+  `json.Decoder.UseNumber()`, so they arrive as `json.Number` and are parsed
+  into `decimal.Decimal` — never through `float64`.
+- **The `case float64` branch** in `extractEventAmount` is a bounds check
+  rather than a pure guard, and it is worth being precise about which: it
+  *rejects* values that are non-integral or whose magnitude exceeds 2^53
+  (precision is already lost by the time the indexer sees them), and it
+  *converts* smaller values via `int64(v)`, which is exact in that range. The
+  branch is only reachable for stray `float64` inputs, since the RPC path
+  yields `json.Number`.
+- **Persistence (fixed here).** Migration `103` widens
+  `vaults.total_deposited`, `current_balance`,
   `yield_earned`, and `fees_paid` from `NUMERIC(20,8)` to `NUMERIC(48,8)`.
   The old type allowed only 12 integer digits and raised `numeric field
   overflow` for any amount at or above 10^12, so large deposits were rejected
@@ -145,7 +193,7 @@ deposit.
 `TestAmountPathHasNoFloat64` is a source-level guard that fails if a `float64`
 conversion is reintroduced into `indexer.go`, `poller.go`, or `fetcher.go`.
 
-### Rolling back migration 102
+### Rolling back migration 103
 
 Narrowing back is lossy by nature: a balance that needed the widened range
 cannot be represented at `NUMERIC(20,8)`, and PostgreSQL raises an overflow
@@ -209,7 +257,7 @@ default unit job.
 | **B-01** | In-memory cursor resets on restart, doubling balances | `TestIntegrationReplay_RestartMidStream` — a fresh poller instance resumes from the persisted cursor and reaches byte-identical state, with `processed_events` proving each event applied exactly once. Enforced by per-event transactional cursor advance. |
 | **B-02** | `startLedger = 0` rejected by RPC, indexer never starts | `TestColdStart_DerivesValidLedgerFromTip` and `TestColdStart_NeverRequestsLedgerZero` — the latter asserts on the values actually handed to the RPC, covering both the absent-key and seeded-`'0'` cases. |
 | **B-03** (as scoped in issue #1051: duplicate-delivery idempotency) | Duplicate delivery corrupts balances | `TestIntegrationReplay_DuplicateDelivery` and `TestIntegrationReplay_RepeatedFullReplay` — enforced by the `processed_events` primary key inside the mutation transaction. Note: PRD B-03 itself refers to a settlement BOLA issue; issue #1051 uses B-03 for indexer idempotency. |
-| **B-11** | `float64` precision loss in `extractEventAmount` | `TestIntegrationLargeAmountRoundTripsExactly`, `TestExtractEventAmount_RejectsUnsafeFloat64`, `TestAmountPathHasNoFloat64`, plus migration `102`. |
+| **B-11** | `float64` precision loss in `extractEventAmount` | `TestIntegrationLargeAmountRoundTripsExactly`, `TestExtractEventAmount_RejectsUnsafeFloat64`, `TestAmountPathHasNoFloat64`, plus migration `103`. |
 
 Transactionality itself is covered by
 `TestIntegrationCursorAndBalanceCommitAtomically`, which forces a balance write
