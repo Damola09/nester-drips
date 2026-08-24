@@ -188,7 +188,7 @@ func replayDB(t *testing.T) *sql.DB {
 // the two vaults the fixture emits events for.
 //
 // Applying every migration (rather than a hand-picked subset) means the schema
-// under test is the schema production runs against — including migration 102,
+// under test is the schema production runs against — including migration 103,
 // which widens the balance columns so i128 stroop amounts fit.
 func freshState(t *testing.T, db *sql.DB) {
 	t.Helper()
